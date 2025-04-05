@@ -1,58 +1,60 @@
-#!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
+import cv2
 import pyrealsense2 as rs
-import numpy as np  # Import numpy
+import numpy as np
 
-class LiveCaptureNode(Node):
+class IntelPublisher(Node):
     def __init__(self):
-        super().__init__('live_capture_node')
-        self.publisher_ = self.create_publisher(Image, '/camera/image_raw', 10)  # Ensure topic matches cube_detection_node
-        self.bridge = CvBridge()
+        super().__init__("intel_publisher")
+        self.intel_publisher_rgb = self.create_publisher(Image, "rgb_frame", 10)
 
-        # Configure RealSense pipeline
-        self.pipeline = rs.pipeline()
-        config = rs.config()
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)  # Configure color stream
-        self.pipeline.start(config)
+        timer_period = 0.05  # 20 Hz
+        self.br_rgb = CvBridge()
 
-        self.timer = self.create_timer(1/30, self.timer_callback)  # 30 Hz
+        try:
+            # Initialize RealSense pipeline
+            self.pipe = rs.pipeline()
+            self.cfg = rs.config()
+            self.cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            self.pipe.start(self.cfg)
+            self.timer = self.create_timer(timer_period, self.timer_callback)
+        except Exception as e:
+            self.get_logger().error(f"Intel RealSense is not connected: {e}")
 
     def timer_callback(self):
         try:
-            # Wait for a coherent pair of frames: depth and color
-            frames = self.pipeline.wait_for_frames()
+            # Wait for a coherent pair of frames
+            frames = self.pipe.wait_for_frames()
             color_frame = frames.get_color_frame()
+
             if not color_frame:
+                self.get_logger().warn("No color frame received")
                 return
 
             # Convert RealSense frame to numpy array
-            frame = np.asanyarray(color_frame.get_data())
+            color_image = np.asanyarray(color_frame.get_data())
 
-            # Convert OpenCV image to ROS2 Image message
-            ros_image = self.bridge.cv2_to_imgmsg(frame, "bgr8")
-            self.publisher_.publish(ros_image)
+            # Publish the frame as a ROS2 Image message
+            self.intel_publisher_rgb.publish(self.br_rgb.cv2_to_imgmsg(color_image, encoding="bgr8"))
+            self.get_logger().info("Publishing RGB frame")
         except Exception as e:
-            self.get_logger().error(f"Error capturing/publishing image: {e}")
+            self.get_logger().error(f"Error in timer_callback: {e}")
 
-    def destroy_node(self):
-        # Stop the RealSense pipeline
-        self.pipeline.stop()
-        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = LiveCaptureNode()
+    intel_publisher = IntelPublisher()
     try:
-        rclpy.spin(node)
+        rclpy.spin(intel_publisher)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()  # Ensure pipeline is stopped
+        intel_publisher.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

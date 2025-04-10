@@ -2,22 +2,24 @@
 
 import rclpy
 from rclpy.node import Node
+
 from geometry_msgs.msg import Point
+from std_msgs.msg import Float32
+
 import math
+import numpy as np
 
 class MotionPlanningSubscriber(Node):
     """
-    A ROS2 node that subscribes to /cube/position and republishes
-    the same position to /motion_planning/cube_position.
-    
-    If you want to filter or transform the position data before
-    sending it on to motion planning, you can do so here.
+    A ROS2 node that subscribes to /cube/position (in the camera frame),
+    applies a transform to the 'robot_base_frame' (if needed), calculates the
+    Euclidean distance, and republishes both the 3D position and distance.
     """
 
     def __init__(self):
         super().__init__('motion_planning_subscriber')
 
-        # Subscribe to the cube's position
+        # Subscribe to the cube's position in camera frame
         self.subscription = self.create_subscription(
             Point,
             '/cube/position',
@@ -25,10 +27,17 @@ class MotionPlanningSubscriber(Node):
             10
         )
 
-        # Publisher to forward the cube's position to the motion planning node
-        self.publisher = self.create_publisher(
+        # Publish the cube position in robot_base_frame
+        self.publisher_pos = self.create_publisher(
             Point,
             '/motion_planning/cube_position',
+            10
+        )
+
+        # Publish the distance (Float32) from the robot base
+        self.publisher_dist = self.create_publisher(
+            Float32,
+            '/cube/distance',
             10
         )
 
@@ -36,29 +45,71 @@ class MotionPlanningSubscriber(Node):
 
     def position_callback(self, msg: Point):
         """
-        Called whenever a new position is received on /cube/position.
-        We pass it along to /motion_planning/cube_position (possibly after
-        some validation checks).
+        1. Transform the position from the camera frame to the robot base frame
+        2. Compute distance from the robot base
+        3. Publish both the new position and the distance
         """
-
-        # Example check: ignore NaN or extreme values
+        # Basic checks for invalid data
         if any(math.isnan(val) for val in [msg.x, msg.y, msg.z]):
             self.get_logger().warn("Received NaN position values; ignoring.")
             return
-
-        # If desired, you can clamp or reject obviously invalid data, e.g. negative distance:
         if msg.z < 0:
             self.get_logger().warn(f"Received negative Z={msg.z:.2f}, ignoring as invalid.")
             return
 
-        # Log the received cube position
+        # Current position in camera frame
+        cam_x = msg.x
+        cam_y = msg.y
+        cam_z = msg.z
+
+        # 1. (Optional) transform to robot_base_frame
+        #    If your camera frame is already your reference, just return (x_c, y_c, z_c).
+        rob_x, rob_y, rob_z = self.camera_to_robot_transform(cam_x, cam_y, cam_z)
+
+        # 2. Compute distance from robot base (0,0,0) in robot frame
+        distance = math.sqrt(rob_x**2 + rob_y**2 + rob_z**2)
+
+        # 3. Publish the new position in the robot frame
+        new_pos = Point(x=rob_x, y=rob_y, z=rob_z)
+        self.publisher_pos.publish(new_pos)
+
+        # 4. Publish the distance on /cube/distance
+        dist_msg = Float32()
+        dist_msg.data = float(distance)
+        self.publisher_dist.publish(dist_msg)
+
+        # Log it
         self.get_logger().info(
-            f"Received cube position: x={msg.x:.3f}, y={msg.y:.3f}, z={msg.z:.3f}"
+            f"Camera frame pos=({cam_x:.3f}, {cam_y:.3f}, {cam_z:.3f}) => "
+            f"Robot frame pos=({rob_x:.3f}, {rob_y:.3f}, {rob_z:.3f}); "
+            f"Distance={distance:.3f} m"
         )
 
-        # Forward the cube's position to /motion_planning/cube_position
-        self.publisher.publish(msg)
-        self.get_logger().info("Republished cube position to /motion_planning/cube_position")
+    def camera_to_robot_transform(self, x_c: float, y_c: float, z_c: float):
+        """
+        Example transform from the camera's optical frame to the robot base frame.
+        If the camera frame is already the robot base frame, just do:
+            return (x_c, y_c, z_c)
+
+        Otherwise, apply known rotation/translation. For example:
+         - Rotate around Z by 180 deg
+         - Translate +0.2 m in Z
+        """
+        # Example rotation around Z by 180 deg
+        theta = math.pi  # 180 deg
+        Rz = np.array([
+            [math.cos(theta), -math.sin(theta), 0],
+            [math.sin(theta),  math.cos(theta), 0],
+            [0,               0,               1]
+        ], dtype=float)
+
+        cam_vec = np.array([x_c, y_c, z_c], dtype=float).reshape(3,1)
+        robot_vec = Rz @ cam_vec
+
+        # Example translation: +0.2 m in Z
+        robot_vec[2] += 0.2
+
+        return (float(robot_vec[0]), float(robot_vec[1]), float(robot_vec[2]))
 
 def main(args=None):
     rclpy.init(args=args)

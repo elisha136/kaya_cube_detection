@@ -58,13 +58,13 @@ def alloc_trt_buffers(engine) -> Tuple[list, list, list, cuda.Stream]:
     return inputs, outputs, bindings, stream
 
 
-class CubeDetectionTRTNode(Node):
+class CubeDetectionNode(Node):  # Class name should follow PEP8 conventions (CamelCase)
     # ──────────────────────────────────────────────────────────────
-    def _init_(self):
-        super()._init_("cube_detection_trt_node")
+    def __init__(self):  # Corrected constructor name (__init__)
+        super().__init__("cube_detection_trt_node")  # Corrected the call to the Node constructor
 
         # ---------- TensorRT -------------------------------------------------
-        trt_path = Path.home() / "models" / "best.trt"   # adjust if necessary
+        trt_path = Path("/home/ntnu01/ros2_ws/src/kaya_cube_detection/model.trt")
         self.engine = load_engine(trt_path)
         self.context = self.engine.create_execution_context()
         self.inputs, self.outputs, self.bindings, self.cuda_stream = alloc_trt_buffers(
@@ -230,7 +230,7 @@ class CubeDetectionTRTNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CubeDetectionTRTNode()
+    node = CubeDetectionNode()  # Corrected node instantiation
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -241,5 +241,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()

@@ -13,15 +13,15 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 
-class LiveCaptureNode(Node):
+class LiveCaptureNode(Node):  # Class name should follow PEP8 conventions (CamelCase)
     """
     Publishes aligned RGB and depth frames:
        /rgb_frame   (sensor_msgs/Image, bgr8)
        /depth_frame (sensor_msgs/Image, mono16)
     """
 
-    def _init_(self):
-        super()._init_("live_capture_node")
+    def __init__(self):  # Corrected constructor name (__init__)
+        super().__init__("live_capture_node")  # Corrected the call to the Node constructor
 
         # ── publishers
         self.color_pub = self.create_publisher(Image, "rgb_frame", 10)
@@ -82,7 +82,7 @@ class LiveCaptureNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = LiveCaptureNode()
+    node = LiveCaptureNode()  # Corrected node instantiation
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -92,5 +92,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()

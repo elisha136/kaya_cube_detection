@@ -14,15 +14,15 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 
 
-class MotionPlanningSubscriber(Node):
-    def _init_(self):
-        super()._init_("motion_planning_subscriber")
+class MotionPlanningSubscriber(Node):  # Class name should follow PEP8 conventions (CamelCase)
+    def __init__(self):  # Corrected constructor name (__init__)
+        super().__init__("motion_planning_subscriber")  # Corrected the call to the Node constructor
 
         self.create_subscription(Point, "/cube/position", self.cb_pos, 10)
         self.pub_pos = self.create_publisher(Point, "/motion_planning/cube_position", 10)
         self.pub_dist = self.create_publisher(Float32, "/cube/distance", 10)
 
-        self.get_logger().info("MotionPlanningSubscriber started.")
+        self.get_logger().info("motion_planning_subscriber started.")
 
     # ──────────────────────────────────────────────────────────────
     def cb_pos(self, msg: Point):
@@ -63,7 +63,7 @@ class MotionPlanningSubscriber(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MotionPlanningSubscriber()
+    node = MotionPlanningSubscriber()  # Corrected node instantiation
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -73,5 +73,6 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
+
     main()

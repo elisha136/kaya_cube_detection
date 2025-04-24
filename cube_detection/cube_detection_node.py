@@ -38,39 +38,48 @@ def load_engine(engine_path: Path) -> trt.ICudaEngine:
         return rt.deserialize_cuda_engine(f.read())
 
 
-def alloc_trt_buffers(engine) -> Tuple[list, list, list, cuda.Stream]:
-    """
-    Returns  (inputs, outputs, bindings, stream)
-      • inputs/outputs: list[dict{"host":…, "dev":…}]
-      • bindings: List[int]  (device ptrs)
-    """
+def alloc_trt_buffers(engine):
+    inputs = []
+    outputs = []
+    bindings = []
     stream = cuda.Stream()
-    inputs, outputs, bindings = [], [], []
-    for binding in engine:
-        size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
-        dtype = trt.nptype(engine.get_binding_dtype(binding))
-        host = cuda.pagelocked_empty(size, dtype)
-        dev = cuda.mem_alloc(host.nbytes)
-        bindings.append(int(dev))
-        (inputs if engine.binding_is_input(binding) else outputs).append(
-            {"host": host, "dev": dev}
-        )
+
+    for name in engine:
+        shape = engine.get_tensor_shape(name)
+        dtype = trt.nptype(engine.get_tensor_dtype(name))
+        size = trt.volume(shape)
+        host_mem = cuda.pagelocked_empty(size, dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
+        bindings.append(int(device_mem))
+        entry = {
+            "name": name,
+            "host": host_mem,
+            "device": device_mem,
+        }
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+            inputs.append(entry)
+        else:
+            outputs.append(entry)
+
     return inputs, outputs, bindings, stream
 
 
 class CubeDetectionNode(Node):  # Class name should follow PEP8 conventions (CamelCase)
     # ──────────────────────────────────────────────────────────────
-    def __init__(self):  # Corrected constructor name (__init__)
-        super().__init__("cube_detection_trt_node")  # Corrected the call to the Node constructor
-
+    def __init__(self): 
+        super().__init__("cube_detection_trt_node") 
         # ---------- TensorRT -------------------------------------------------
         trt_path = Path("/home/ntnu01/ros2_ws/src/kaya_cube_detection/model.trt")
         self.engine = load_engine(trt_path)
-        self.context = self.engine.create_execution_context()
-        self.inputs, self.outputs, self.bindings, self.cuda_stream = alloc_trt_buffers(
-            self.engine
-        )
-        self.batch, self.in_c, self.in_h, self.in_w = (1, *self.engine.get_binding_shape(0))
+        # use execution_context instead of context to avoid attribute conflict
+        self.execution_context = self.engine.create_execution_context()
+
+        self.inputs, self.outputs, self.bindings, self.cuda_stream = alloc_trt_buffers(self.engine)
+
+        # determine input shape via explicit-batch API
+        input_name = self.engine.get_tensor_name(0)
+        shape = self.engine.get_tensor_shape(input_name)
+        self.batch, self.in_c, self.in_h, self.in_w = shape
         self.get_logger().info(f"TensorRT engine loaded: {trt_path.name} "
                                f"(expects {self.in_w}×{self.in_h})")
 
@@ -179,24 +188,24 @@ class CubeDetectionNode(Node):  # Class name should follow PEP8 conventions (Cam
 
     def _run_inference(self, img: np.ndarray) -> List[Tuple[int, int, int, int, float, int]]:
         host_in = self.inputs[0]["host"]
-        np.copyto(host_in, self._preprocess(img).ravel())
-        cuda.memcpy_htod_async(self.inputs[0]["dev"], host_in, self.cuda_stream)
-        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.cuda_stream.handle)
-        cuda.memcpy_dtoh_async(self.outputs[0]["host"], self.outputs[0]["dev"], self.cuda_stream)
-        self.cuda_stream.synchronize()
+        host_out = self.outputs[0]["host"]
 
-        out = self.outputs[0]["host"]
+        # copy input to device
+        cuda.memcpy_htod(self.inputs[0]["device"], host_in)
+        # run inference synchronously
+        self.execution_context.execute_v2(self.bindings)
+        # copy output back to host
+        cuda.memcpy_dtoh(host_out, self.outputs[0]["device"])
 
         # YOLOv8 TRT export → (num,6): x1,y1,x2,y2,conf,cls
-        detections = out.reshape(-1, 6)
-        detections = detections[detections[:, 4] > 0.3]      # conf threshold
-        detections = detections[detections[:, 5] == 0]       # cube class id = 0
-        detections = detections[np.argsort(-detections[:, 4])]   # sort high→low
+        detections = host_out.reshape(-1, 6)
+        detections = detections[detections[:, 4] > 0.3]
+        detections = detections[detections[:, 5] == 0]
+        detections = detections[np.argsort(-detections[:, 4])]
 
         res: List[Tuple[int, int, int, int, float, int]] = []
         for det in detections:
             x1, y1, x2, y2, conf, cls_id = det
-            # scale to 640×480
             sx, sy = 640 / self.in_w, 480 / self.in_h
             x1, y1, x2, y2 = [int(v * s) for v, s in zip((x1, y1, x2, y2), (sx, sy, sx, sy))]
             res.append((x1, y1, x2, y2, float(conf), int(cls_id)))
@@ -230,7 +239,7 @@ class CubeDetectionNode(Node):  # Class name should follow PEP8 conventions (Cam
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CubeDetectionNode()  # Corrected node instantiation
+    node = CubeDetectionNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

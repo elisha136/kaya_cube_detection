@@ -7,16 +7,15 @@ import numpy as np
 import cv2
 import threading
 
-from sensor_msgs.msg import Image, Imu
+from sensor_msgs.msg import Image
 from geometry_msgs.msg import Quaternion
 from cv_bridge import CvBridge
 
 class LiveCaptureNode(Node):
     """
     A ROS2 node that uses one RealSense pipeline for color and depth.
-    (No IMU streams, since D435 doesn't have IMU onboard.)
-    Frames are retrieved in a dedicated thread (via wait_for_frames())
-    and published on separate topics:
+    Frames are aligned so depth matches color resolution (640x480).
+    Aligned frames are published on:
       - /rgb_frame   (sensor_msgs/Image)
       - /depth_frame (sensor_msgs/Image)
     """
@@ -28,8 +27,6 @@ class LiveCaptureNode(Node):
         # Publishers
         self.color_publisher = self.create_publisher(Image, 'rgb_frame', 10)
         self.depth_publisher = self.create_publisher(Image, 'depth_frame', 10)
-        # If you had a D435i, you would also publish IMU:
-        # self.imu_publisher = self.create_publisher(Imu, 'camera/imu', 10)
 
         self.bridge = CvBridge()
 
@@ -38,21 +35,20 @@ class LiveCaptureNode(Node):
         self.pipeline = rs.pipeline()
         self.config = rs.config()
 
-        # Enable color + depth
+        # Enable color + depth at 640x480 resolution
         self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
-        # D435i example (comment out for D435):
-        # self.config.enable_stream(rs.stream.gyro)
-        # self.config.enable_stream(rs.stream.accel)
-
         try:
             _profile = self.pipeline.start(self.config)
-            self.get_logger().info("RealSense pipeline started successfully (D435).")
+            self.get_logger().info("RealSense pipeline started successfully.")
         except Exception as e:
             self.get_logger().error(f"Failed to start RealSense pipeline: {e}")
             self.pipeline = None
             return
+
+        # Align depth → color so every (u,v) pixel lines up
+        self.align = rs.align(rs.stream.color)
 
         # Start thread to publish frames
         self.publish_thread = threading.Thread(target=self.frame_publisher_loop, daemon=True)
@@ -70,51 +66,35 @@ class LiveCaptureNode(Node):
             if not frameset:
                 continue
 
-            for frame in frameset:
-                stream_type = frame.profile.stream_type()
+            # Project depth onto the 640×480 color plane
+            aligned_frames = self.align.process(frameset)
 
-                # Color frame
-                if stream_type == rs.stream.color:
-                    color_image = np.asanyarray(frame.get_data())
-                    color_msg = self.bridge.cv2_to_imgmsg(color_image, encoding='bgr8')
-                    color_msg.header.stamp = self.get_clock().now().to_msg()
-                    color_msg.header.frame_id = 'camera_color_frame'
-                    self.color_publisher.publish(color_msg)
-                    self.get_logger().debug("Published color frame.")
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
+            if not color_frame or not depth_frame:
+                continue
 
-                # Depth frame
-                elif stream_type == rs.stream.depth:
-                    depth_image = np.asanyarray(frame.get_data())
-                    depth_msg = self.bridge.cv2_to_imgmsg(depth_image, encoding='mono16')
-                    depth_msg.header.stamp = self.get_clock().now().to_msg()
-                    depth_msg.header.frame_id = 'camera_depth_frame'
-                    self.depth_publisher.publish(depth_msg)
-                    self.get_logger().debug("Published depth frame.")
+            # Convert color frame to ROS Image
+            color_image = np.asanyarray(color_frame.get_data())
+            color_msg = self.bridge.cv2_to_imgmsg(color_image, encoding='bgr8')
+            color_msg.header.stamp = self.get_clock().now().to_msg()
+            color_msg.header.frame_id = 'camera_color_frame'
+            self.color_publisher.publish(color_msg)
 
-                # IMU data (uncomment if D435i):
-                # elif frame.is_motion_frame():
-                #     motion_frame = frame.as_motion_frame()
-                #     motion_data = motion_frame.get_motion_data()
-                #     imu_msg = Imu()
-                #     imu_msg.header.stamp = self.get_clock().now().to_msg()
-                #     imu_msg.header.frame_id = 'camera_imu_frame'
-                #     if stream_type == rs.stream.gyro:
-                #         imu_msg.angular_velocity.x = motion_data.x
-                #         imu_msg.angular_velocity.y = motion_data.y
-                #         imu_msg.angular_velocity.z = motion_data.z
-                #     elif stream_type == rs.stream.accel:
-                #         imu_msg.linear_acceleration.x = motion_data.x
-                #         imu_msg.linear_acceleration.y = motion_data.y
-                #         imu_msg.linear_acceleration.z = motion_data.z
-                #     imu_msg.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-                #     self.imu_publisher.publish(imu_msg)
-                #     self.get_logger().debug(f"Published IMU data ({stream_type}).")
+            # Convert aligned depth frame to ROS Image
+            depth_image = np.asanyarray(depth_frame.get_data())
+            depth_msg = self.bridge.cv2_to_imgmsg(depth_image, encoding='mono16')
+            depth_msg.header.stamp = self.get_clock().now().to_msg()
+            depth_msg.header.frame_id = 'camera_depth_frame'
+            self.depth_publisher.publish(depth_msg)
+
+            self.get_logger().debug("Published aligned color+depth frames.")
 
         self.get_logger().info("Exiting frame publisher loop...")
 
     def destroy_node(self):
         self.get_logger().info("Stopping RealSense pipeline...")
-        self.stop_event.set()  # stop the thread
+        self.stop_event.set()
         if hasattr(self, 'publish_thread') and self.publish_thread.is_alive():
             self.publish_thread.join(timeout=2.0)
         if self.pipeline:

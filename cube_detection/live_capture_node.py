@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#
+# live_capture_node.py  – RealSense RGB + depth publisher (640×480 @ 30 Hz)
 
 import rclpy
 from rclpy.node import Node
@@ -8,98 +10,75 @@ import cv2
 import threading
 
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Quaternion
 from cv_bridge import CvBridge
+
 
 class LiveCaptureNode(Node):
     """
-    A ROS2 node that uses one RealSense pipeline for color and depth.
-    Frames are aligned so depth matches color resolution (640x480).
-    Aligned frames are published on:
-      - /rgb_frame   (sensor_msgs/Image)
-      - /depth_frame (sensor_msgs/Image)
+    Publishes aligned RGB and depth frames:
+       /rgb_frame   (sensor_msgs/Image, bgr8)
+       /depth_frame (sensor_msgs/Image, mono16)
     """
 
-    def __init__(self):
-        super().__init__('live_capture_node')
-        self.get_logger().info("Initializing LiveCaptureNode...")
+    def _init_(self):
+        super()._init_("live_capture_node")
 
-        # Publishers
-        self.color_publisher = self.create_publisher(Image, 'rgb_frame', 10)
-        self.depth_publisher = self.create_publisher(Image, 'depth_frame', 10)
-
+        # ── publishers
+        self.color_pub = self.create_publisher(Image, "rgb_frame", 10)
+        self.depth_pub = self.create_publisher(Image, "depth_frame", 10)
         self.bridge = CvBridge()
 
-        # Prepare RealSense pipeline
-        self.stop_event = threading.Event()
+        # ── RealSense pipeline
+        self.stop_evt = threading.Event()
+        pipe_cfg = rs.config()
+        pipe_cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        pipe_cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+
         self.pipeline = rs.pipeline()
-        self.config = rs.config()
-
-        # Enable color + depth at 640x480 resolution
-        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-
         try:
-            _profile = self.pipeline.start(self.config)
-            self.get_logger().info("RealSense pipeline started successfully.")
-        except Exception as e:
-            self.get_logger().error(f"Failed to start RealSense pipeline: {e}")
-            self.pipeline = None
-            return
+            self.pipeline.start(pipe_cfg)
+            self.get_logger().info("RealSense pipeline started.")
+        except Exception as exc:
+            self.get_logger().error(f"Cannot start RealSense pipeline: {exc}")
+            raise SystemExit(1)
 
-        # Align depth → color so every (u,v) pixel lines up
         self.align = rs.align(rs.stream.color)
+        self.worker = threading.Thread(target=self._loop, daemon=True)
+        self.worker.start()
 
-        # Start thread to publish frames
-        self.publish_thread = threading.Thread(target=self.frame_publisher_loop, daemon=True)
-        self.publish_thread.start()
-
-    def frame_publisher_loop(self):
-        self.get_logger().info("Starting frame publisher loop...")
-        while not self.stop_event.is_set():
+    # ──────────────────────────────────────────────────────────────
+    def _loop(self):
+        while not self.stop_evt.is_set():
             try:
-                frameset = self.pipeline.wait_for_frames(timeout_ms=500)
-            except RuntimeError as e:
-                self.get_logger().warn(f"No frames received in 500 ms: {e}")
+                frames = self.pipeline.wait_for_frames(500)
+            except RuntimeError:
+                continue
+            frames = self.align.process(frames)
+            c, d = frames.get_color_frame(), frames.get_depth_frame()
+            if not c or not d:
                 continue
 
-            if not frameset:
-                continue
+            stamp = self.get_clock().now().to_msg()
+            color_img = np.asanyarray(c.get_data())
+            depth_img = np.asanyarray(d.get_data())
 
-            # Project depth onto the 640×480 color plane
-            aligned_frames = self.align.process(frameset)
+            self._pub_img(color_img, self.color_pub, "bgr8", stamp, "camera_color_frame")
+            self._pub_img(depth_img, self.depth_pub, "mono16", stamp, "camera_depth_frame")
 
-            color_frame = aligned_frames.get_color_frame()
-            depth_frame = aligned_frames.get_depth_frame()
-            if not color_frame or not depth_frame:
-                continue
+    def _pub_img(self, arr, pub, enc, stamp, frame_id):
+        msg = self.bridge.cv2_to_imgmsg(arr, enc)
+        msg.header.stamp = stamp
+        msg.header.frame_id = frame_id
+        pub.publish(msg)
 
-            # Convert color frame to ROS Image
-            color_image = np.asanyarray(color_frame.get_data())
-            color_msg = self.bridge.cv2_to_imgmsg(color_image, encoding='bgr8')
-            color_msg.header.stamp = self.get_clock().now().to_msg()
-            color_msg.header.frame_id = 'camera_color_frame'
-            self.color_publisher.publish(color_msg)
-
-            # Convert aligned depth frame to ROS Image
-            depth_image = np.asanyarray(depth_frame.get_data())
-            depth_msg = self.bridge.cv2_to_imgmsg(depth_image, encoding='mono16')
-            depth_msg.header.stamp = self.get_clock().now().to_msg()
-            depth_msg.header.frame_id = 'camera_depth_frame'
-            self.depth_publisher.publish(depth_msg)
-
-            self.get_logger().debug("Published aligned color+depth frames.")
-
-        self.get_logger().info("Exiting frame publisher loop...")
-
+    # ──────────────────────────────────────────────────────────────
     def destroy_node(self):
-        self.get_logger().info("Stopping RealSense pipeline...")
-        self.stop_event.set()
-        if hasattr(self, 'publish_thread') and self.publish_thread.is_alive():
-            self.publish_thread.join(timeout=2.0)
-        if self.pipeline:
-            self.pipeline.stop()
+        self.stop_evt.set()
+        if self.worker.is_alive():
+            self.worker.join()
+        self.pipeline.stop()
         super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -110,10 +89,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+        rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if _name_ == "_main_":
     main()

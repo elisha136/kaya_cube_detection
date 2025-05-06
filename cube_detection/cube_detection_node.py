@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-
-
-
+import sys
 import rclpy
 from rclpy.node import Node
-
+import os
 import cv2
 import numpy as np
 from cv_bridge import CvBridge
-
+from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseArray, Pose
 
@@ -40,22 +38,24 @@ Author: Adimalara
         # -----------------------------
         # Resolve model path
         # -----------------------------
-        user_model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        user_model_path = self.get_parameter('model_path') \
+                              .get_parameter_value().string_value
         if user_model_path:
             model_path = user_model_path
         else:
-            # Resolve relative path to models/best.pt from this file's location
-            script_dir = os.path.dirname(os.path.abspath(__file__))  # path to cube_detection/
-            model_path = os.path.join(script_dir, '..', 'models', 'best.pt')
-            model_path = os.path.abspath(model_path)
+            # Now correctly use ROS-2’s share directory lookup
+            pkg_share = get_package_share_directory('cube_detection')
+            model_path = os.path.join(pkg_share, 'models', 'best.pt')
 
-        self.show_detections = self.get_parameter('show_detections').get_parameter_value().bool_value
+        self.show_detections = self.get_parameter('show_detections') \
+                                   .get_parameter_value().bool_value
 
         # -----------------------------
         # Load YOLO Model
         # -----------------------------
+        self.get_logger().info(f"Loading YOLO model from: {model_path}")
         self.model = YOLO(model_path)
-        self.get_logger().info(f"Loaded YOLO model from: {model_path}")
+
 
 
         # -----------------------------

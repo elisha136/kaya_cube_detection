@@ -27,18 +27,28 @@ This node:
  5. Publishes tracked positions as a geometry_msgs/PoseArray to /cube/positions.
 
 Author: Adimalara
-"""
-
+"""   
     def __init__(self):
         super().__init__('cube_detection_node')
 
         # -----------------------------
         # Declare Parameters
         # -----------------------------
-        self.declare_parameter('model_path', '/home/tmkristi/PycharmProjects/AIS4002-Detection/runs/detect/train_yolov8n_cube_robust/weights/best.pt')
+        self.declare_parameter('model_path', '')
         self.declare_parameter('show_detections', True)
 
-        model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        # -----------------------------
+        # Resolve model path
+        # -----------------------------
+        user_model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        if user_model_path:
+            model_path = user_model_path
+        else:
+            # Resolve relative path to models/best.pt from this file's location
+            script_dir = os.path.dirname(os.path.abspath(__file__))  # path to cube_detection/
+            model_path = os.path.join(script_dir, '..', 'models', 'best.pt')
+            model_path = os.path.abspath(model_path)
+
         self.show_detections = self.get_parameter('show_detections').get_parameter_value().bool_value
 
         # -----------------------------
@@ -46,6 +56,7 @@ Author: Adimalara
         # -----------------------------
         self.model = YOLO(model_path)
         self.get_logger().info(f"Loaded YOLO model from: {model_path}")
+
 
         # -----------------------------
         # Camera Intrinsics (calibrated for 640x480)

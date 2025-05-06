@@ -18,6 +18,7 @@ class LiveCaptureNode(Node):
     Aligned frames are published on:
       - /rgb_frame   (sensor_msgs/Image)
       - /depth_frame (sensor_msgs/Image)
+      Author: Adimalara
     """
 
     def __init__(self):
@@ -74,18 +75,23 @@ class LiveCaptureNode(Node):
             if not color_frame or not depth_frame:
                 continue
 
+            # Confirm both have the same resolution
+            if color_frame.get_width() != depth_frame.get_width() or color_frame.get_height() != depth_frame.get_height():
+                self.get_logger().warn("Color and depth frame size mismatch; skipping frame.")
+                continue
+
             # Convert color frame to ROS Image
             color_image = np.asanyarray(color_frame.get_data())
             color_msg = self.bridge.cv2_to_imgmsg(color_image, encoding='bgr8')
             color_msg.header.stamp = self.get_clock().now().to_msg()
-            color_msg.header.frame_id = 'camera_color_frame'
+            color_msg.header.frame_id = 'camera_link'  # unified frame_id
             self.color_publisher.publish(color_msg)
 
             # Convert aligned depth frame to ROS Image
             depth_image = np.asanyarray(depth_frame.get_data())
             depth_msg = self.bridge.cv2_to_imgmsg(depth_image, encoding='mono16')
             depth_msg.header.stamp = self.get_clock().now().to_msg()
-            depth_msg.header.frame_id = 'camera_depth_frame'
+            depth_msg.header.frame_id = 'camera_link'  # unified frame_id
             self.depth_publisher.publish(depth_msg)
 
             self.get_logger().debug("Published aligned color+depth frames.")

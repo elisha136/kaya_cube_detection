@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+
+
 import rclpy
 from rclpy.node import Node
 
@@ -8,41 +10,45 @@ import numpy as np
 from cv_bridge import CvBridge
 
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Point
 from geometry_msgs.msg import PoseArray, Pose
 
 from ultralytics import YOLO
+import pyrealsense2 as rs
 
 class CubeDetectionNode(Node):
     """
-    A ROS 2 node that:
-     1) Subscribes to /rgb_frame (color) and /depth_frame (depth) -- both 640x480 after alignment
-     2) Runs YOLO on the color image to detect cubes
-     3) Uses the color camera's pinhole model + bounding box center pixel (median depth) to get 3D positions
-     4) Tracks 3D positions over time using an Extended Kalman Filter (constant velocity in 3D)
-     5) Publishes all filtered 3D positions as a PoseArray
-    """
+ROS 2 Cube Detection Node with YOLOv8 and Intel RealSense D435
+
+This node:
+ 1. Subscribes to /rgb_frame and /depth_frame topics.
+ 2. Runs YOLOv8 inference on RGB frames to detect cubes.
+ 3. Estimates 3D positions of cubes using aligned depth values from the RealSense camera.
+ 4. Applies an Extended Kalman Filter (EKF) for 3D tracking of detected cubes.
+ 5. Publishes tracked positions as a geometry_msgs/PoseArray to /cube/positions.
+
+Author: Adimalara
+"""
 
     def __init__(self):
         super().__init__('cube_detection_node')
 
         # -----------------------------
-        # 1. Declare ROS Parameters
+        # Declare Parameters
         # -----------------------------
-        self.declare_parameter('model_path', '/home/manulab/projects/Cubeproject/Dataset/results/cube_detection_exp3/weights/best.pt')
+        self.declare_parameter('model_path', '/home/tmkristi/PycharmProjects/AIS4002-Detection/runs/detect/train_yolov8n_cube_robust/weights/best.pt')
         self.declare_parameter('show_detections', True)
 
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.show_detections = self.get_parameter('show_detections').get_parameter_value().bool_value
 
         # -----------------------------
-        # 2. YOLO Setup
+        # Load YOLO Model
         # -----------------------------
         self.model = YOLO(model_path)
         self.get_logger().info(f"Loaded YOLO model from: {model_path}")
 
         # -----------------------------
-        # 3. Camera Intrinsic Params (calibrated/scaled for 640x480)
+        # Camera Intrinsics (calibrated for 640x480)
         # -----------------------------
         self.fx = 458.314
         self.fy = 609.756
@@ -53,7 +59,7 @@ class CubeDetectionNode(Node):
         self.depth_height = 480
 
         # -----------------------------
-        # 4. ROS Subscribers and Publishers
+        #  Subscribers & Publishers
         # -----------------------------
         self.bridge = CvBridge()
 
@@ -62,28 +68,30 @@ class CubeDetectionNode(Node):
 
         self.cube_positions_pub = self.create_publisher(PoseArray, '/cube/positions', 10)
 
-        # Store latest depth image and last timestamp
+        # -----------------------------
+        #  State and EKF Setup
+        # -------------------------------
         self.latest_depth_image = None
         self.last_timestamp = None
 
-        # EKF filter state for each cube (for now: track only top N cubes)
-        self.max_cubes = 5  # Max number of cubes to track
+        self.max_cubes = 5
         self.states = [np.zeros(6, dtype=np.float32) for _ in range(self.max_cubes)]
         self.Ps = [np.eye(6, dtype=np.float32) for _ in range(self.max_cubes)]
 
-        # Covariance parameters
         self.process_noise = np.eye(6, dtype=np.float32) * 0.2
         self.measurement_noise = np.eye(3, dtype=np.float32) * 0.3
 
-        self.get_logger().info("CubeDetectionNode initialized successfully with dynamic dt, median depth, and multi-cube tracking.")
+        self.get_logger().info("CubeDetectionNode initialized successfully with RealSense distance and EKF tracking.")
 
     def depth_frame_callback(self, msg: Image):
+        """Callback to store the latest depth frame."""
         try:
             self.latest_depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono16')
         except Exception as e:
             self.get_logger().error(f"Error converting depth image: {e}")
 
     def rgb_frame_callback(self, msg: Image):
+        """Main callback: runs YOLO, calculates 3D positions, applies EKF, publishes PoseArray."""
         try:
             color_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
@@ -94,13 +102,12 @@ class CubeDetectionNode(Node):
             self.get_logger().info("No depth frame yet; skipping detection.")
             return
 
-        # Calculate dynamic dt
         current_timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if self.last_timestamp is None:
             dt = 0.1
         else:
             dt = current_timestamp - self.last_timestamp
-            dt = max(0.01, min(dt, 0.5))  # Clamp dt to reasonable range
+            dt = max(0.01, min(dt, 0.5))
         self.last_timestamp = current_timestamp
 
         detections_2d = self.detect_cubes_2d(color_image)
@@ -110,23 +117,24 @@ class CubeDetectionNode(Node):
 
         poses = PoseArray()
         poses.header.stamp = msg.header.stamp
-        poses.header.frame_id = 'camera_link' 
+        poses.header.frame_id = 'camera_link'
 
         for i, (cx_px, cy_px, conf) in enumerate(detections_2d[:self.max_cubes]):
             if not (0 <= cx_px < self.depth_width and 0 <= cy_px < self.depth_height):
                 continue
 
-            depth_m = self.get_median_depth(cx_px, cy_px)
-            if depth_m is None:
+            # Retrieve raw depth and convert to meters
+            depth_m = self.latest_depth_image[cy_px, cx_px] * 0.001
+            if depth_m <= 0:
                 continue
 
+            # Project 2D center to 3D coordinate using pinhole model
             X_m = (cx_px - self.cx) * depth_m / self.fx
             Y_m = (cy_px - self.cy) * depth_m / self.fy
             Z_m = depth_m
 
             measurement = np.array([X_m, Y_m, Z_m], dtype=np.float32)
 
-            # Predict and update EKF for this cube
             self.ekf_predict(i, dt)
             self.ekf_update(i, measurement)
 
@@ -138,12 +146,11 @@ class CubeDetectionNode(Node):
 
             self.get_logger().info(f"Cube {i}: x={pose.position.x:.2f}, y={pose.position.y:.2f}, z={pose.position.z:.2f}, conf={conf:.2f}")
 
-            # Optional visualization
+            # Visualization
             if self.show_detections:
                 cv2.circle(color_image, (cx_px, cy_px), 5, (0,255,0), -1)
-                cv2.putText(color_image, f"{conf:.2f}", (cx_px+5, cy_px-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                cv2.putText(color_image, f"{conf:.2f} {Z_m:.2f}m", (cx_px+5, cy_px-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
 
-        # Publish all cube positions
         if poses.poses:
             self.cube_positions_pub.publish(poses)
 
@@ -152,9 +159,7 @@ class CubeDetectionNode(Node):
             cv2.waitKey(1)
 
     def detect_cubes_2d(self, color_image: np.ndarray):
-        """
-        YOLO inference. Returns list of (cx, cy, confidence), sorted descending by confidence.
-        """
+        """YOLO inference. Returns list of (cx, cy, confidence) sorted by confidence."""
         results = self.model(color_image)
         detections = []
         for result in results:
@@ -168,28 +173,8 @@ class CubeDetectionNode(Node):
         detections.sort(key=lambda x: x[2], reverse=True)
         return detections
 
-    def get_median_depth(self, cx_px, cy_px, window_size=5):
-        """
-        Returns the median depth around the (cx, cy) pixel.
-        """
-        half_w = window_size // 2
-        x1 = max(cx_px - half_w, 0)
-        y1 = max(cy_px - half_w, 0)
-        x2 = min(cx_px + half_w, self.depth_width-1)
-        y2 = min(cy_px + half_w, self.depth_height-1)
-
-        depth_window = self.latest_depth_image[y1:y2+1, x1:x2+1]
-        valid_depths = depth_window[depth_window > 0]
-
-        if valid_depths.size == 0:
-            return None
-
-        return np.median(valid_depths) / 1000.0  # Convert mm to meters
-
     def ekf_predict(self, idx, dt):
-        """
-        Constant velocity predict step for cube idx.
-        """
+        """Performs EKF prediction for a given cube index."""
         F = np.array([
             [1, 0, 0, dt, 0,  0 ],
             [0, 1, 0, 0,  dt, 0 ],
@@ -203,9 +188,7 @@ class CubeDetectionNode(Node):
         self.Ps[idx] = F @ self.Ps[idx] @ F.T + self.process_noise
 
     def ekf_update(self, idx, measurement: np.ndarray):
-        """
-        Measurement update step for cube idx.
-        """
+        """Performs EKF update using a new 3D position measurement."""
         H = np.array([
             [1, 0, 0, 0, 0, 0],
             [0, 1, 0, 0, 0, 0],
@@ -226,6 +209,7 @@ class CubeDetectionNode(Node):
         self.Ps[idx] = (I - K @ H) @ self.Ps[idx]
 
 def main(args=None):
+    """Entry point for ROS 2 node."""
     rclpy.init(args=args)
     node = CubeDetectionNode()
     try:
@@ -239,12 +223,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-# This is a ROS 2 node for detecting cubes in a color image and estimating their 3D positions using depth data.
-# It uses YOLO for object detection and an Extended Kalman Filter for tracking.
-# The node subscribes to color and depth images, processes them, and publishes the detected cube positions.
-# The code includes dynamic dt calculation, median depth extraction, and multi-cube tracking.
-# The node is designed to be run in a ROS 2 environment and requires the ultralytics YOLO library and OpenCV.
-# The node is initialized with camera intrinsic parameters and can visualize detections if configured.
-# The EKF is used to predict and update the state of each detected cube, allowing for smooth tracking over time.
-# The code is structured to handle multiple cubes, with a maximum limit set for tracking.
-# The node is designed to be modular and can be extended for additional functionality as needed.

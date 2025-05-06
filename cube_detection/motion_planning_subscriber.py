@@ -19,6 +19,12 @@ class MotionPlanningSubscriber(Node):
     def __init__(self):
         super().__init__('motion_planning_subscriber')
 
+        # Declare optional parameters
+        self.declare_parameter('z_offset', 0.2)  # default: 20 cm above camera
+
+        # Fetch parameter
+        self.z_offset = self.get_parameter('z_offset').get_parameter_value().double_value
+
         # Subscribe to the cube's position in camera frame
         self.subscription = self.create_subscription(
             Point,
@@ -63,7 +69,6 @@ class MotionPlanningSubscriber(Node):
         cam_z = msg.z
 
         # 1. (Optional) transform to robot_base_frame
-        #    If your camera frame is already your reference, just return (x_c, y_c, z_c).
         rob_x, rob_y, rob_z = self.camera_to_robot_transform(cam_x, cam_y, cam_z)
 
         # 2. Compute distance from robot base (0,0,0) in robot frame
@@ -93,7 +98,7 @@ class MotionPlanningSubscriber(Node):
 
         Otherwise, apply known rotation/translation. For example:
          - Rotate around Z by 180 deg
-         - Translate +0.2 m in Z
+         - Translate +z_offset meters in Z
         """
         # Example rotation around Z by 180 deg
         theta = math.pi  # 180 deg
@@ -106,8 +111,8 @@ class MotionPlanningSubscriber(Node):
         cam_vec = np.array([x_c, y_c, z_c], dtype=float).reshape(3,1)
         robot_vec = Rz @ cam_vec
 
-        # Example translation: +0.2 m in Z
-        robot_vec[2] += 0.2
+        # Example translation: +z_offset m in Z
+        robot_vec[2] += self.z_offset
 
         return (float(robot_vec[0]), float(robot_vec[1]), float(robot_vec[2]))
 

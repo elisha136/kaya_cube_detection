@@ -3,59 +3,63 @@
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Pose
 from std_msgs.msg import Float32
 
+from tf2_ros import Buffer, TransformListener, LookupException, ExtrapolationException, TransformException
+from tf2_geometry_msgs import PointStamped, do_transform_point
+
 import math
-import numpy as np
+
 
 class MotionPlanningSubscriber(Node):
-    """
-    A ROS2 node that subscribes to /cube/position (in the camera frame),
-    applies a transform to the 'robot_base_frame' (if needed), calculates the
-    Euclidean distance, and republishes both the 3D position and distance.
+    """ROS 2 node that transforms cube position, computes distance, and publishes both.
+
+    Subscribes to /cube/position (or user-defined topic), transforms the position
+    to the robot base frame (using tf2), calculates distance to the origin,
+    and republishes both position and distance.
+
+    Attributes:
+        tf_buffer (Buffer): Buffer for storing transforms.
+        tf_listener (TransformListener): Listener to fill the buffer.
     """
 
     def __init__(self):
+        """Initializes the MotionPlanningSubscriber node."""
         super().__init__('motion_planning_subscriber')
 
-        # Declare optional parameters
-        self.declare_parameter('z_offset', 0.2)  # default: 20 cm above camera
+        # Declare configurable parameters with defaults
+        self.declare_parameter('input_topic', '/cube/position')
+        self.declare_parameter('output_position_topic', '/motion_planning/cube_position')
+        self.declare_parameter('output_distance_topic', '/cube/distance')
+        self.declare_parameter('source_frame', 'camera_frame')
+        self.declare_parameter('target_frame', 'robot_base_frame')
 
-        # Fetch parameter
-        self.z_offset = self.get_parameter('z_offset').get_parameter_value().double_value
+        # Retrieve parameters
+        self.input_topic = self.get_parameter('input_topic').get_parameter_value().string_value
+        self.output_position_topic = self.get_parameter('output_position_topic').get_parameter_value().string_value
+        self.output_distance_topic = self.get_parameter('output_distance_topic').get_parameter_value().string_value
+        self.source_frame = self.get_parameter('source_frame').get_parameter_value().string_value
+        self.target_frame = self.get_parameter('target_frame').get_parameter_value().string_value
 
-        # Subscribe to the cube's position in camera frame
-        self.subscription = self.create_subscription(
-            Point,
-            '/cube/position',
-            self.position_callback,
-            10
-        )
+        # Set up tf2 listener
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Publish the cube position in robot_base_frame
-        self.publisher_pos = self.create_publisher(
-            Point,
-            '/motion_planning/cube_position',
-            10
-        )
+        # Set up subscriptions and publishers
+        self.subscription = self.create_subscription(Point, self.input_topic, self.position_callback, 10)
+        self.publisher_pos = self.create_publisher(Pose, self.output_position_topic, 10)
+        self.publisher_dist = self.create_publisher(Float32, self.output_distance_topic, 10)
 
-        # Publish the distance (Float32) from the robot base
-        self.publisher_dist = self.create_publisher(
-            Float32,
-            '/cube/distance',
-            10
-        )
-
-        self.get_logger().info("MotionPlanningSubscriber node started.")
+        self.get_logger().info(f"MotionPlanningSubscriber started. Listening on {self.input_topic}.")
 
     def position_callback(self, msg: Point):
+        """Handles incoming position messages, transforms them, computes distance, and publishes results.
+
+        Args:
+            msg (Point): Incoming position message in the source frame.
         """
-        1. Transform the position from the camera frame to the robot base frame
-        2. Compute distance from the robot base
-        3. Publish both the new position and the distance
-        """
-        # Basic checks for invalid data
+        # Validate incoming data
         if any(math.isnan(val) for val in [msg.x, msg.y, msg.z]):
             self.get_logger().warn("Received NaN position values; ignoring.")
             return
@@ -63,60 +67,51 @@ class MotionPlanningSubscriber(Node):
             self.get_logger().warn(f"Received negative Z={msg.z:.2f}, ignoring as invalid.")
             return
 
-        # Current position in camera frame
-        cam_x = msg.x
-        cam_y = msg.y
-        cam_z = msg.z
+        # Wrap point in PointStamped with source frame
+        stamped_point = PointStamped()
+        stamped_point.header.frame_id = self.source_frame
+        stamped_point.point = msg
 
-        # 1. (Optional) transform to robot_base_frame
-        rob_x, rob_y, rob_z = self.camera_to_robot_transform(cam_x, cam_y, cam_z)
+        try:
+            # Lookup transform from source to target frame
+            transform = self.tf_buffer.lookup_transform(
+                self.target_frame,
+                self.source_frame,
+                rclpy.time.Time()
+            )
 
-        # 2. Compute distance from robot base (0,0,0) in robot frame
-        distance = math.sqrt(rob_x**2 + rob_y**2 + rob_z**2)
+            # Transform point to target frame
+            transformed_point = do_transform_point(stamped_point, transform).point
 
-        # 3. Publish the new position in the robot frame
-        new_pos = Point(x=rob_x, y=rob_y, z=rob_z)
-        self.publisher_pos.publish(new_pos)
+        except (LookupException, ExtrapolationException, TransformException) as e:
+            self.get_logger().warn(f"Transform lookup failed: {e}")
+            return
 
-        # 4. Publish the distance on /cube/distance
-        dist_msg = Float32()
-        dist_msg.data = float(distance)
-        self.publisher_dist.publish(dist_msg)
-
-        # Log it
-        self.get_logger().info(
-            f"Camera frame pos=({cam_x:.3f}, {cam_y:.3f}, {cam_z:.3f}) => "
-            f"Robot frame pos=({rob_x:.3f}, {rob_y:.3f}, {rob_z:.3f}); "
-            f"Distance={distance:.3f} m"
+        # Compute distance to origin in target frame
+        distance = math.sqrt(
+            transformed_point.x ** 2 +
+            transformed_point.y ** 2 +
+            transformed_point.z ** 2
         )
 
-    def camera_to_robot_transform(self, x_c: float, y_c: float, z_c: float):
-        """
-        Example transform from the camera's optical frame to the robot base frame.
-        If the camera frame is already the robot base frame, just do:
-            return (x_c, y_c, z_c)
+        # Create Pose with identity orientation (no rotation)
+        pose_msg = Pose()
+        pose_msg.position = transformed_point
+        pose_msg.orientation.w = 1.0  # Identity quaternion
 
-        Otherwise, apply known rotation/translation. For example:
-         - Rotate around Z by 180 deg
-         - Translate +z_offset meters in Z
-        """
-        # Example rotation around Z by 180 deg
-        theta = math.pi  # 180 deg
-        Rz = np.array([
-            [math.cos(theta), -math.sin(theta), 0],
-            [math.sin(theta),  math.cos(theta), 0],
-            [0,               0,               1]
-        ], dtype=float)
+        # Publish transformed pose and distance
+        self.publisher_pos.publish(pose_msg)
+        self.publisher_dist.publish(Float32(data=float(distance)))
 
-        cam_vec = np.array([x_c, y_c, z_c], dtype=float).reshape(3,1)
-        robot_vec = Rz @ cam_vec
+        # Log results
+        self.get_logger().info(
+            f"Transformed position: ({transformed_point.x:.3f}, {transformed_point.y:.3f}, {transformed_point.z:.3f}) "
+            f"in '{self.target_frame}'; Distance={distance:.3f} m"
+        )
 
-        # Example translation: +z_offset m in Z
-        robot_vec[2] += self.z_offset
-
-        return (float(robot_vec[0]), float(robot_vec[1]), float(robot_vec[2]))
 
 def main(args=None):
+    """Entry point for the ROS 2 node."""
     rclpy.init(args=args)
     node = MotionPlanningSubscriber()
     try:
@@ -127,5 +122,7 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
+
 if __name__ == '__main__':
     main()
+
